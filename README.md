@@ -6,39 +6,70 @@ A lightweight wrapper contract that enables [Chainlink SVR](https://docs.chain.l
 
 ListaDAO's Liquidator contract only accepts liquidation calls from **pre-approved (whitelisted) addresses**. In the Atlas SVR flow, the direct caller is the searcher's solver contract and the transaction is submitted by a Chainlink node operator — neither is a fixed whitelistable address. This wrapper solves that by becoming the single whitelisted address on ListaDAO and validating inbound calls before forwarding them.
 
-## How It Works
+## Full SVR Flow
+
+The integration test (`test_svrMetacallOracleUpdateAndLiquidation`) exercises the complete production flow in a single atomic Atlas `metacall`:
 
 ```
-Chainlink NOP submits Atlas metacall (oracle update + searcher liquidation)
+Chainlink NOP (bundler) submits Atlas metacall
     │
     ▼
-Atlas calls winning searcher's solver contract (SVRListaSolver)
+1. _preOpsCall (ChainlinkSvrDAppControl)
+    ├── Validates bundler is whitelisted (or authorized on oracle)
+    ├── Validates userOp.from is the authorized userOp signer
+    ├── Validates userOp calls DAppControl.update()
+    ├── Validates target oracle is whitelisted
+    └── Validates oracle function selector is allowed
     │
     ▼
-Solver calls SVRLiquidationWrapper.liquidate()
-    │
-    ├── Validates msg.sender is an approved solver
-    ├── Validates tx.origin is an approved Chainlink NOP
-    │
-    ▼
-Wrapper forwards call to ListaDAO Liquidator
-    │
-    ├── ListaDAO sees wrapper as caller → whitelist passes
-    ├── Collateral transferred to wrapper
-    ├── onMorphoLiquidate callback → wrapper pulls loan tokens from solver
-    ├── Wrapper approves Liquidator to pull loan tokens
+2. UserOp executes: Oracle Price Update
+    ├── ExecutionEnvironment calls DAppControl.update(oracle, callData)
+    ├── DAppControl calls ChainlinkSvrDAppExecutor.execute(oracle, callData)
+    └── Executor calls Oracle.forward() → price updated on-chain
     │
     ▼
-Collateral forwarded back to solver, loan tokens sent to Liquidator
+3. SolverOp executes: ListaDAO Liquidation
+    ├── Atlas calls winning solver via ExecutionEnvironment
+    ├── SolverBase.atlasSolverCall() → SVRListaSolver.executeLiquidation()
+    ├── Solver calls SVRLiquidationWrapper.liquidate()
+    │   ├── Validates msg.sender is approved solver
+    │   ├── Validates tx.origin is approved NOP (= bundler)
+    │   └── Forwards to ListaDAO Liquidator
+    │       ├── ListaDAO sees wrapper as caller → whitelist passes
+    │       ├── Collateral transferred to wrapper
+    │       ├── onMorphoLiquidate callback → wrapper pulls loan tokens from solver
+    │       └── Wrapper approves Liquidator to pull loan tokens
+    └── Collateral forwarded to solver, loan tokens sent to Liquidator
+    │
+    ▼
+4. _allocateValueCall (ChainlinkSvrDAppControl)
+    ├── OEV distributed to Fastlane (configurable %)
+    ├── OEV distributed to block builder (configurable %)
+    └── Remaining OEV sent to protocol destination
 ```
 
 ## Contracts
 
-| Contract | Description |
-|---|---|
-| `SVRLiquidationWrapper.sol` | Core wrapper. Whitelisted on ListaDAO. Validates callers, forwards liquidations, handles token routing and Morpho callback. |
-| `SVRListaSolver.sol` | Atlas solver (inherits `SolverBase`). Called during `metacall`, invokes the wrapper. |
-| `MockListaLiquidator.sol` | Test mock simulating ListaDAO's whitelisted Morpho-style liquidation. Not for deployment. |
+### Core (to deploy)
+
+| Contract | Location | Description |
+|---|---|---|
+| `SVRLiquidationWrapper.sol` | `src/` | Core wrapper. Whitelisted on ListaDAO. Validates callers (dual access control), forwards liquidations, handles token routing and Morpho callback. |
+| `SVRListaSolver.sol` | `src/` | Atlas solver (inherits `SolverBase`). Called during `metacall`, invokes the wrapper. |
+
+### Chainlink SVR Reference (not ours to deploy)
+
+| Contract | Location | Description |
+|---|---|---|
+| `ChainlinkSvrDAppControl.sol` | `src/svr/` | Production DAppControl from [atlas-chainlink-external](https://github.com/smartcontractkit/atlas-chainlink-external). Handles preOps validation (bundler, oracle, selector whitelist), OEV allocation, and oracle updates via the executor. |
+| `ChainlinkSvrDAppExecutor.sol` | `src/svr/` | Stable executor authorized on oracles. Forwards calls from DAppControl to oracles. Allows DAppControl upgrades without re-authorization. |
+
+### Test Mocks
+
+| Contract | Location | Description |
+|---|---|---|
+| `MockListaLiquidator.sol` | `src/` | Simulates ListaDAO's whitelisted Morpho-style liquidation with callback. |
+| `MockOracle` | `test/` | Simulates a Chainlink oracle with `IAuthorizedForwarder` interface. |
 
 ### Key Addresses (BNB Chain Mainnet)
 
@@ -62,6 +93,24 @@ Collateral forwarded back to solver, loan tokens sent to Liquidator
 | `removeApprovedNOP()` | Owner | Remove a node operator |
 | `recoverToken()` | Owner | Emergency token recovery |
 
+## ChainlinkSvrDAppControl Configuration
+
+The `ChainlinkSvrDAppControl` used in integration tests mirrors the production contract with these Atlas CallConfig flags:
+
+| Flag | Value | Purpose |
+|---|---|---|
+| `requirePreOps` | `true` | Validates bundler, oracle, selector, and userOp signer before execution |
+| `reuseUserOp` | `true` | Oracle update executes regardless of solver outcome |
+| `verifyCallChainHash` | `true` | DAppOp must commit to exact set of solverOps (prevents reordering) |
+| `requireFulfillment` | `true` | At least one solver must succeed for the transaction to complete |
+
+Key configuration during deployment:
+- **Bundler whitelist**: Chainlink NOPs authorized to submit metacalls
+- **Oracle whitelist**: Chainlink oracles that can be updated via SVR
+- **Allowed selectors**: Only `IAuthorizedForwarder.forward()` by default
+- **Authorized userOp signer**: Chainlink node that creates oracle update userOps
+- **OEV shares**: Configurable split between Fastlane, block builder, and protocol
+
 ## Test Coverage
 
 **17 tests total, all passing. No RPC or fork required.**
@@ -74,10 +123,11 @@ Collateral forwarded back to solver, loan tokens sent to Liquidator
 - Callback data handling
 - Liquidator whitelist enforcement
 - Callback caller-only restriction
-- End-to-end token flow (collateral → solver, loan tokens → liquidator, wrapper ends clean)
+- End-to-end token flow (collateral -> solver, loan tokens -> liquidator, wrapper ends clean)
 
 ### Integration Tests (2)
-- Full Atlas `metacall` flow: deploys Atlas infrastructure, builds and signs UserOperation + SolverOperation + DAppOperation, executes the complete chain (Atlas → ExecutionEnvironment → SolverBase → SVRListaSolver → SVRLiquidationWrapper → MockListaLiquidator), verifies all token balances
+- **Full SVR metacall flow** (`test_svrMetacallOracleUpdateAndLiquidation`): Deploys Atlas + ChainlinkSvrDAppControl + ChainlinkSvrDAppExecutor + MockOracle. Builds and signs UserOperation (oracle update) + SolverOperation (liquidation) + DAppOperation (with callChainHash). Executes the complete chain. Verifies both oracle price update AND liquidation token balances.
+- **Unauthorized bundler rejection** (`test_svrRejectsUnauthorizedBundler`): Verifies that `_preOpsCall` rejects metacalls from non-whitelisted bundlers, and the oracle price remains unchanged.
 
 ## Setup
 
@@ -98,8 +148,11 @@ forge build
 forge test -vv
 ```
 
+> **Why `--recurse-submodules`?** This repo uses git submodules for its dependencies (forge-std, OpenZeppelin, Atlas). The `--recurse-submodules` flag clones those alongside the main repo so Foundry can resolve imports.
+
 ## What's Left Before Mainnet
 
+- [x] **Full SVR DAppControl integration** — ChainlinkSvrDAppControl + Executor in test suite
 - [ ] **BNB Chain fork test** against real ListaDAO contracts to verify actual token flows
 - [ ] **Flash liquidation test** — callback is implemented but needs dedicated testing with the flash path
 - [ ] **Pre-liquidation support** — partial position closure before standard threshold
@@ -112,4 +165,5 @@ forge test -vv
 
 - [forge-std](https://github.com/foundry-rs/forge-std)
 - [OpenZeppelin Contracts](https://github.com/OpenZeppelin/openzeppelin-contracts) (Ownable, SafeERC20)
-- [Atlas](https://github.com/FastLane-Labs/atlas) (SolverBase, Atlas test infrastructure)
+- [Atlas](https://github.com/FastLane-Labs/atlas) (SolverBase, DAppControl, Atlas infrastructure)
+- [atlas-chainlink-external](https://github.com/smartcontractkit/atlas-chainlink-external) (ChainlinkSvrDAppControl, ChainlinkSvrDAppExecutor — reference copies in `src/svr/`)

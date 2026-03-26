@@ -285,21 +285,32 @@ contract SVRLiquidationWrapperUnitTest is Test {
 }
 
 // ================================================== //
-//     Integration Tests (with Atlas doMetacall)      //
+//     Integration Tests (with full SVR + Atlas)       //
 // ================================================== //
+//
+// Uses the real ChainlinkSvrDAppControl and ChainlinkSvrDAppExecutor
+// from https://github.com/smartcontractkit/atlas-chainlink-external
+// to test the complete SVR liquidation flow:
+//
+//   Chainlink NOP (bundler) submits Atlas metacall
+//     → _preOpsCall: validates bundler, oracle, selector, userOp signer
+//     → UserOp: DAppControl.update() → Executor → Oracle price update
+//     → SolverOp: SVRListaSolver.executeLiquidation() → Wrapper → Liquidator
+//     → _allocateValueCall: OEV distribution
+//
 
-import { TxBuilder } from "atlas/helpers/TxBuilder.sol";
 import { SolverOperation } from "atlas/types/SolverOperation.sol";
 import { UserOperation } from "atlas/types/UserOperation.sol";
-import { DAppConfig } from "atlas/types/ConfigTypes.sol";
 import "atlas/types/DAppOperation.sol";
-import { DAppControl } from "atlas/dapp/DAppControl.sol";
 import { CallConfig } from "atlas/types/ConfigTypes.sol";
 import { Atlas } from "atlas/atlas/Atlas.sol";
 import { AtlasVerification } from "atlas/atlas/AtlasVerification.sol";
 import { ExecutionEnvironment } from "atlas/common/ExecutionEnvironment.sol";
 import { FactoryLib } from "atlas/atlas/FactoryLib.sol";
-import { Sorter } from "atlas/helpers/Sorter.sol";
+import { CallVerification } from "atlas/libraries/CallVerification.sol";
+
+import { ChainlinkSvrDAppControl } from "../src/svr/ChainlinkSvrDAppControl.sol";
+import { ChainlinkSvrDAppExecutor } from "../src/svr/ChainlinkSvrDAppExecutor.sol";
 
 /// @notice Mock WETH for non-fork testing
 contract MockWETH is MockERC20 {
@@ -309,56 +320,41 @@ contract MockWETH is MockERC20 {
     receive() external payable { _mint(msg.sender, msg.value); }
 }
 
-/// @notice Minimal DAppControl for testing the wrapper flow in Atlas.
-contract TestDAppControl is DAppControl {
-    constructor(address _atlas) DAppControl(
-        _atlas,
-        msg.sender,
-        CallConfig({
-            userNoncesSequential: false,
-            dappNoncesSequential: false,
-            requirePreOps: false,
-            trackPreOpsReturnData: false,
-            trackUserReturnData: false,
-            delegateUser: false,
-            requirePreSolver: false,
-            requirePostSolver: false,
-            zeroSolvers: false,
-            reuseUserOp: false,
-            userAuctioneer: false,
-            solverAuctioneer: false,
-            unknownAuctioneer: false,
-            verifyCallChainHash: false,
-            forwardReturnData: false,
-            requireFulfillment: false,
-            trustedOpHash: false,
-            invertBidValue: false,
-            exPostBids: false,
-            multipleSuccessfulSolvers: false,
-            checkMetacallGasLimit: false
-        })
-    ) {}
-
-    function getBidFormat(UserOperation calldata) public pure override returns (address) {
-        return address(0); // ETH bids
-    }
-
-    function getBidValue(SolverOperation calldata solverOp) public pure override returns (uint256) {
-        return solverOp.bidAmount;
-    }
-
-    function _allocateValueCall(bool, address, uint256, bytes calldata) internal virtual override {}
-
-    /// @notice No-op function that the userOp calls to simulate an oracle update
-    function noOp() external {}
-}
-
-/// @notice Simulator stub - Atlas needs a simulator address but we don't use simulation in tests
+/// @notice Simulator stub — Atlas needs a simulator address but we don't use simulation in tests
 contract MockSimulator {
     address public atlas;
     function setAtlas(address _atlas) external { atlas = _atlas; }
 }
 
+/// @notice Mock Chainlink oracle with authorized forwarder interface.
+///         In production this is a real Chainlink Aggregator with SVR support.
+contract MockOracle {
+    uint256 public price;
+    mapping(address sender => bool isAuthorized) internal authorizedSenders;
+
+    constructor(address _authorizedSender) {
+        authorizedSenders[_authorizedSender] = true;
+        price = 100;
+    }
+
+    function isAuthorizedSender(address sender) external view returns (bool) {
+        return authorizedSenders[sender];
+    }
+
+    /// @notice IAuthorizedForwarder.forward — called by the executor to update price
+    function forward(address, bytes memory data) external {
+        require(authorizedSenders[msg.sender], "Unauthorized updater");
+        price = abi.decode(data, (uint256));
+    }
+
+    function setAuthorizedSender(address sender, bool isAuthorized) external {
+        authorizedSenders[sender] = isAuthorized;
+    }
+}
+
+/// @title SVR Integration Test
+/// @notice Full Atlas metacall test using ChainlinkSvrDAppControl, oracle update,
+///         and ListaDAO liquidation in a single atomic transaction.
 contract SVRLiquidationWrapperIntegrationTest is Test {
     struct Sig { uint8 v; bytes32 r; bytes32 s; }
 
@@ -366,48 +362,77 @@ contract SVRLiquidationWrapperIntegrationTest is Test {
     Atlas public atlas;
     AtlasVerification public atlasVerification;
 
+    // Chainlink SVR infrastructure
+    ChainlinkSvrDAppControl public dappControl;
+    ChainlinkSvrDAppExecutor public dappExecutor;
+    MockOracle public mockOracle;
+
+    // ListaDAO infrastructure
     MockListaLiquidator public mockLiquidator;
     SVRLiquidationWrapper public wrapper;
     SVRListaSolver public listaSolver;
-    TestDAppControl public testDAppControl;
-    TxBuilder public txBuilder;
-    Sig public sig;
 
     MockERC20 public loanToken;
     MockERC20 public collateralToken;
     MockWETH public weth;
+    Sig public sig;
 
-    address deployer = makeAddr("Deployer");
+    address deployer;
 
-    uint256 governancePK;
-    address governanceEOA;
-    uint256 userPK;
-    address userEOA;
-    uint256 solverOnePK;
-    address solverOneEOA;
+    // Chainlink NOP = Atlas bundler (submits metacall, is tx.origin)
+    address bundlerNOP;
 
-    address dAppGovEOA;
+    // Authorized userOp signer (Chainlink node authorized to create oracle update userOps)
+    uint256 userOpSignerPK;
+    address userOpSigner;
+
+    // DApp governance signatory (signs DAppOperations)
+    uint256 auctioneerPK;
+    address auctioneer;
+
+    // Searcher / solver EOA
+    uint256 solverPK;
+    address solverEOA;
+
+    // DApp governance EOA (deploys and configures DAppControl)
+    address govEOA;
+
+    // OEV allocation destinations
+    address fastlaneDest;
+    address protocolDest;
+
     address executionEnvironment;
 
     MarketParams defaultMarketParams;
     uint256 seizedAssets = 100e18;
 
     function setUp() public {
-        // Create accounts
-        (userEOA, userPK) = makeAddrAndKey("userEOA");
-        (governanceEOA, governancePK) = makeAddrAndKey("govEOA");
-        (solverOneEOA, solverOnePK) = makeAddrAndKey("solverOneEOA");
-        dAppGovEOA = makeAddr("dAppGov");
+        // ------------------------------------------------ //
+        //              1. Create accounts                   //
+        // ------------------------------------------------ //
+        deployer = makeAddr("deployer");
+        bundlerNOP = makeAddr("bundlerNOP");
+        (userOpSigner, userOpSignerPK) = makeAddrAndKey("userOpSigner");
+        (auctioneer, auctioneerPK) = makeAddrAndKey("auctioneer");
+        (solverEOA, solverPK) = makeAddrAndKey("solverEOA");
+        govEOA = makeAddr("govEOA");
+        fastlaneDest = makeAddr("fastlaneDest");
+        protocolDest = makeAddr("protocolDest");
 
-        vm.deal(solverOneEOA, 100e18);
         vm.deal(deployer, 100e18);
+        vm.deal(solverEOA, 100e18);
+        vm.deal(bundlerNOP, 100e18);
 
-        // Deploy mock tokens
+        // ------------------------------------------------ //
+        //              2. Deploy tokens                    //
+        // ------------------------------------------------ //
         weth = new MockWETH();
         loanToken = new MockERC20("Loan Token", "LOAN");
         collateralToken = new MockERC20("Collateral Token", "COLL");
 
-        // Deploy Atlas infrastructure (mirrors BaseTest.__deployAtlasContracts)
+        // ------------------------------------------------ //
+        //       3. Deploy Atlas infrastructure             //
+        // ------------------------------------------------ //
         vm.startPrank(deployer);
 
         MockSimulator simulator = new MockSimulator();
@@ -417,7 +442,6 @@ contract SVRLiquidationWrapperIntegrationTest is Test {
 
         ExecutionEnvironment execEnvTemplate = new ExecutionEnvironment(expectedAtlasAddr);
 
-        // Deploy FactoryLib from precompiled artifact
         string memory factoryLibPath = "lib/atlas/src/contracts/precompiles/FactoryLib.sol/FactoryLib.json";
         FactoryLib factoryLib = FactoryLib(deployCode(factoryLibPath, abi.encode(address(execEnvTemplate))));
 
@@ -439,27 +463,65 @@ contract SVRLiquidationWrapperIntegrationTest is Test {
         simulator.setAtlas(address(atlas));
         vm.stopPrank();
 
-        // Fund solver and deposit in Atlas
-        vm.startPrank(solverOneEOA);
+        // Fund solver in Atlas escrow
+        vm.startPrank(solverEOA);
         atlas.deposit{ value: 1e18 }();
         vm.stopPrank();
 
-        // Deploy mock liquidator
-        mockLiquidator = new MockListaLiquidator();
+        // ------------------------------------------------ //
+        //   4. Deploy Chainlink SVR DAppControl + Executor //
+        // ------------------------------------------------ //
+        vm.startPrank(govEOA);
 
-        // Deploy DAppControl and register governance signatory
-        vm.startPrank(dAppGovEOA);
-        testDAppControl = new TestDAppControl(address(atlas));
-        atlasVerification.initializeGovernance(address(testDAppControl));
-        // Add our governanceEOA as a signatory for signing dAppOps
-        atlasVerification.addSignatory(address(testDAppControl), governanceEOA);
+        dappExecutor = new ChainlinkSvrDAppExecutor();
+        dappControl = new ChainlinkSvrDAppControl(
+            address(atlas),
+            address(dappExecutor),
+            1000, // 10% Fastlane OEV share
+            1000, // 10% Builder OEV share (remaining 80% → protocol)
+            fastlaneDest,
+            protocolDest
+        );
+
+        // Authorize DAppControl to call through the executor
+        dappExecutor.authorizeDAppControl(address(dappControl));
+
+        // Set the authorized userOp signer (Chainlink node)
+        dappControl.setAuthorizedUserOpSigner(userOpSigner);
+
+        // Register DAppControl with Atlas governance
+        atlasVerification.initializeGovernance(address(dappControl));
+
+        // Add auctioneer as signatory for signing DAppOperations
+        atlasVerification.addSignatory(address(dappControl), auctioneer);
+
+        // Whitelist the bundler (Chainlink NOP)
+        address[] memory bundlers = new address[](1);
+        bundlers[0] = bundlerNOP;
+        dappControl.addBundlersToWhitelist(bundlers);
+
         vm.stopPrank();
 
-        // Create execution environment
-        vm.prank(userEOA);
-        executionEnvironment = atlas.createExecutionEnvironment(userEOA, address(testDAppControl));
+        // ------------------------------------------------ //
+        //           5. Deploy MockOracle                   //
+        // ------------------------------------------------ //
+        // The executor is the authorized sender on the oracle
+        mockOracle = new MockOracle(address(dappExecutor));
 
-        // Deploy wrapper
+        // Whitelist the oracle on DAppControl
+        vm.prank(govEOA);
+        dappControl.addOracleToWhitelist(address(mockOracle));
+
+        // ------------------------------------------------ //
+        //   6. Create execution environment for signer    //
+        // ------------------------------------------------ //
+        vm.prank(userOpSigner);
+        executionEnvironment = atlas.createExecutionEnvironment(userOpSigner, address(dappControl));
+
+        // ------------------------------------------------ //
+        //   7. Deploy ListaDAO mock + Wrapper              //
+        // ------------------------------------------------ //
+        mockLiquidator = new MockListaLiquidator();
         wrapper = new SVRLiquidationWrapper(address(mockLiquidator), address(this));
         mockLiquidator.setApprovedCaller(address(wrapper));
 
@@ -471,53 +533,98 @@ contract SVRLiquidationWrapperIntegrationTest is Test {
             lltv: 8000
         });
 
-        txBuilder = new TxBuilder({
-            _control: address(testDAppControl),
-            _atlas: address(atlas),
-            _verification: address(atlasVerification)
-        });
-
+        // ------------------------------------------------ //
+        //                   Labels                         //
+        // ------------------------------------------------ //
         vm.label(address(atlas), "Atlas");
         vm.label(address(atlasVerification), "AtlasVerification");
+        vm.label(address(dappControl), "ChainlinkSvrDAppControl");
+        vm.label(address(dappExecutor), "ChainlinkSvrDAppExecutor");
+        vm.label(address(mockOracle), "MockOracle");
         vm.label(address(wrapper), "SVRLiquidationWrapper");
         vm.label(address(mockLiquidator), "MockListaLiquidator");
+        vm.label(bundlerNOP, "BundlerNOP");
+        vm.label(userOpSigner, "UserOpSigner");
+        vm.label(auctioneer, "Auctioneer");
+        vm.label(solverEOA, "SolverEOA");
     }
 
-    function test_atlasMetacallLiquidation() public {
-        UserOperation memory userOp;
-        SolverOperation[] memory solverOps = new SolverOperation[](1);
-        DAppOperation memory dAppOp;
-
-        // Deploy solver as solverOneEOA
-        vm.startPrank(solverOneEOA);
+    /// @notice Full SVR metacall test: oracle update + ListaDAO liquidation in one atomic tx.
+    ///
+    /// This mirrors the production flow where a Chainlink NOP submits an Atlas metacall
+    /// containing both the SVR oracle price update and the searcher's liquidation.
+    ///
+    /// Flow:
+    ///   1. NOP (bundlerNOP) submits atlas.metacall(userOp, solverOps, dAppOp)
+    ///   2. _preOpsCall validates bundler whitelist, oracle whitelist, selector, signer
+    ///   3. UserOp executes: DAppControl.update() → Executor → Oracle.forward() (price update)
+    ///   4. SolverOp executes: SVRListaSolver.executeLiquidation()
+    ///        → SVRLiquidationWrapper.liquidate()
+    ///        → MockListaLiquidator.liquidate() (token flow)
+    ///   5. _allocateValueCall distributes OEV to Fastlane, builder, protocol
+    function test_svrMetacallOracleUpdateAndLiquidation() public {
+        // ============================================ //
+        //       Deploy solver and configure wrapper    //
+        // ============================================ //
+        vm.startPrank(solverEOA);
         listaSolver = new SVRListaSolver(address(weth), address(atlas), address(wrapper));
         atlas.bond(1e18);
         vm.stopPrank();
 
-        // Approve the solver and the NOP (userEOA acts as Chainlink NOP here)
+        // Approve solver on wrapper + bundlerNOP as approved NOP
         wrapper.addApprovedSolver(address(listaSolver));
-        wrapper.addApprovedNOP(userEOA);
+        wrapper.addApprovedNOP(bundlerNOP);
 
-        // Fund: give solver loan tokens for repayment, give liquidator collateral
+        // Fund tokens
         loanToken.mint(address(listaSolver), 1000e18);
         collateralToken.mint(address(mockLiquidator), 1000e18);
 
-        // Solver approves wrapper to pull loan tokens during callback
+        // Solver pre-approves wrapper to pull loan tokens during callback
         vm.prank(address(listaSolver));
         loanToken.approve(address(wrapper), type(uint256).max);
 
-        // Build UserOperation (no-op for POC - in prod this would be SVR oracle update)
-        userOp = txBuilder.buildUserOperation({
-            from: userEOA,
-            to: address(testDAppControl),
-            maxFeePerGas: block.basefee + 1e9,
-            value: 0,
-            deadline: block.number + 2,
-            data: abi.encodeWithSelector(TestDAppControl.noOp.selector)
-        });
-        userOp.sessionKey = governanceEOA;
+        // ============================================ //
+        //           Build UserOperation               //
+        // ============================================ //
+        // The userOp calls DAppControl.update(oracle, callData) which
+        // forwards through the Executor to update the oracle price.
+        bytes memory oracleCallData = abi.encodeCall(
+            MockOracle.forward,
+            (address(0), abi.encode(uint256(42))) // Update price to 42
+        );
+        bytes memory userOpData = abi.encodeCall(
+            ChainlinkSvrDAppControl.update,
+            (address(mockOracle), oracleCallData)
+        );
 
-        // Build SolverOperation - encodes the liquidation call
+        UserOperation memory userOp = UserOperation({
+            from: userOpSigner,
+            to: address(atlas),
+            value: 0,
+            gas: 1_200_000,
+            maxFeePerGas: 1e9,
+            nonce: 1,
+            deadline: block.number + 100,
+            dapp: address(dappControl),
+            control: address(dappControl),
+            callConfig: dappControl.CALL_CONFIG(),
+            dappGasLimit: dappControl.getDAppGasLimit(),
+            solverGasLimit: dappControl.getSolverGasLimit(),
+            bundlerSurchargeRate: dappControl.getBundlerSurchargeRate(),
+            sessionKey: address(0),
+            data: userOpData,
+            signature: new bytes(0)
+        });
+
+        // Sign userOp with the authorized signer's private key
+        (sig.v, sig.r, sig.s) = vm.sign(userOpSignerPK, atlasVerification.getUserOperationPayload(userOp));
+        userOp.signature = abi.encodePacked(sig.r, sig.s, sig.v);
+
+        // ============================================ //
+        //          Build SolverOperation              //
+        // ============================================ //
+        bytes32 userOpHash = atlasVerification.getUserOperationHash(userOp);
+
         bytes memory solverOpData = abi.encodeWithSelector(
             SVRListaSolver.executeLiquidation.selector,
             defaultMarketParams,
@@ -527,44 +634,79 @@ contract SVRLiquidationWrapperIntegrationTest is Test {
             "" // callback data
         );
 
-        solverOps[0] = txBuilder.buildSolverOperation({
-            userOp: userOp,
-            solverOpData: solverOpData,
-            solver: solverOneEOA,
-            solverContract: address(listaSolver),
-            bidAmount: 0, // Zero bid for POC - no ETH payment needed
-            value: 0
+        SolverOperation[] memory solverOps = new SolverOperation[](1);
+        solverOps[0] = SolverOperation({
+            from: solverEOA,
+            to: address(atlas),
+            value: 0,
+            gas: 6_000_000,
+            maxFeePerGas: 1e9,
+            deadline: block.number + 100,
+            solver: address(listaSolver),
+            control: address(dappControl),
+            userOpHash: userOpHash,
+            bidToken: address(0),
+            bidAmount: 0, // Zero bid — no OEV payment in this POC
+            data: solverOpData,
+            signature: new bytes(0)
         });
 
         // Sign solver operation
-        (sig.v, sig.r, sig.s) = vm.sign(solverOnePK, atlasVerification.getSolverPayload(solverOps[0]));
+        (sig.v, sig.r, sig.s) = vm.sign(solverPK, atlasVerification.getSolverPayload(solverOps[0]));
         solverOps[0].signature = abi.encodePacked(sig.r, sig.s, sig.v);
 
-        // Build and sign DApp operation
-        dAppOp = txBuilder.buildDAppOperation(governanceEOA, userOp, solverOps);
-        (sig.v, sig.r, sig.s) = vm.sign(governancePK, atlasVerification.getDAppOperationPayload(dAppOp));
+        // ============================================ //
+        //          Build DAppOperation                //
+        // ============================================ //
+        // verifyCallChainHash is true — must include correct callChainHash
+        bytes32 callChainHash = CallVerification.getCallChainHash(userOp, solverOps);
+
+        DAppOperation memory dAppOp = DAppOperation({
+            from: auctioneer,
+            to: address(atlas),
+            nonce: 0,
+            deadline: block.number + 100,
+            control: address(dappControl),
+            bundler: bundlerNOP,
+            userOpHash: userOpHash,
+            callChainHash: callChainHash,
+            signature: new bytes(0)
+        });
+
+        // Sign DApp operation with auctioneer key
+        (sig.v, sig.r, sig.s) = vm.sign(auctioneerPK, atlasVerification.getDAppOperationPayload(dAppOp));
         dAppOp.signature = abi.encodePacked(sig.r, sig.s, sig.v);
 
-        // Record balances before
+        // ============================================ //
+        //        Record balances & execute            //
+        // ============================================ //
         uint256 solverCollBefore = collateralToken.balanceOf(address(listaSolver));
         uint256 solverLoanBefore = loanToken.balanceOf(address(listaSolver));
         uint256 liquidatorCollBefore = collateralToken.balanceOf(address(mockLiquidator));
+        uint256 oraclePriceBefore = mockOracle.price();
 
-        // Set tx.gasprice to avoid division by zero in Atlas gas accounting
         vm.txGasPrice(1e9);
 
-        // Execute metacall as the NOP (userEOA is both msg.sender and tx.origin)
-        vm.prank(userEOA, userEOA);
-        atlas.metacall{ gas: 5_000_000 }({
+        // NOP submits the metacall (msg.sender = bundlerNOP, tx.origin = bundlerNOP)
+        vm.prank(bundlerNOP, bundlerNOP);
+        atlas.metacall{ gas: 8_000_000 }({
             userOp: userOp,
             solverOps: solverOps,
             dAppOp: dAppOp,
             gasRefundBeneficiary: address(0)
         });
 
+        // ============================================ //
+        //                Assertions                   //
+        // ============================================ //
+
+        // 1. Oracle price was updated (SVR oracle update succeeded)
+        assertEq(mockOracle.price(), 42, "Oracle price should be updated to 42");
+        assertTrue(mockOracle.price() != oraclePriceBefore, "Oracle price should have changed");
+
+        // 2. Collateral moved: Liquidator → Solver
         uint256 expectedRepaid = seizedAssets / 2;
 
-        // Check collateral moved from liquidator to solver
         assertEq(
             collateralToken.balanceOf(address(mockLiquidator)),
             liquidatorCollBefore - seizedAssets,
@@ -576,7 +718,7 @@ contract SVRLiquidationWrapperIntegrationTest is Test {
             "Solver should have gained collateral"
         );
 
-        // Check loan tokens moved from solver to liquidator
+        // 3. Loan tokens moved: Solver → Liquidator
         assertEq(
             loanToken.balanceOf(address(listaSolver)),
             solverLoanBefore - expectedRepaid,
@@ -588,12 +730,118 @@ contract SVRLiquidationWrapperIntegrationTest is Test {
             "Liquidator should have received loan repayment"
         );
 
-        // Wrapper should be clean
+        // 4. Wrapper is clean — no residual tokens
         assertEq(loanToken.balanceOf(address(wrapper)), 0, "Wrapper loan balance should be 0");
         assertEq(collateralToken.balanceOf(address(wrapper)), 0, "Wrapper collateral balance should be 0");
 
-        console.log("Atlas metacall liquidation successful!");
+        console.log("=== SVR Metacall Liquidation Successful ===");
+        console.log("Oracle price updated:", oraclePriceBefore, "->", mockOracle.price());
         console.log("Seized collateral:", seizedAssets);
         console.log("Repaid loan tokens:", expectedRepaid);
+    }
+
+    /// @notice Test that an unauthorized bundler is rejected by _preOpsCall
+    function test_svrRejectsUnauthorizedBundler() public {
+        // Deploy solver
+        vm.startPrank(solverEOA);
+        listaSolver = new SVRListaSolver(address(weth), address(atlas), address(wrapper));
+        atlas.bond(1e18);
+        vm.stopPrank();
+
+        wrapper.addApprovedSolver(address(listaSolver));
+        wrapper.addApprovedNOP(bundlerNOP);
+
+        loanToken.mint(address(listaSolver), 1000e18);
+        collateralToken.mint(address(mockLiquidator), 1000e18);
+        vm.prank(address(listaSolver));
+        loanToken.approve(address(wrapper), type(uint256).max);
+
+        // Build operations (same as above)
+        bytes memory oracleCallData = abi.encodeCall(
+            MockOracle.forward,
+            (address(0), abi.encode(uint256(99)))
+        );
+        bytes memory userOpData = abi.encodeCall(
+            ChainlinkSvrDAppControl.update,
+            (address(mockOracle), oracleCallData)
+        );
+
+        UserOperation memory userOp = UserOperation({
+            from: userOpSigner,
+            to: address(atlas),
+            value: 0,
+            gas: 1_200_000,
+            maxFeePerGas: 1e9,
+            nonce: 1,
+            deadline: block.number + 100,
+            dapp: address(dappControl),
+            control: address(dappControl),
+            callConfig: dappControl.CALL_CONFIG(),
+            dappGasLimit: dappControl.getDAppGasLimit(),
+            solverGasLimit: dappControl.getSolverGasLimit(),
+            bundlerSurchargeRate: dappControl.getBundlerSurchargeRate(),
+            sessionKey: address(0),
+            data: userOpData,
+            signature: new bytes(0)
+        });
+
+        (sig.v, sig.r, sig.s) = vm.sign(userOpSignerPK, atlasVerification.getUserOperationPayload(userOp));
+        userOp.signature = abi.encodePacked(sig.r, sig.s, sig.v);
+
+        bytes32 userOpHash = atlasVerification.getUserOperationHash(userOp);
+        bytes memory solverOpData = abi.encodeWithSelector(
+            SVRListaSolver.executeLiquidation.selector,
+            defaultMarketParams, address(0), seizedAssets, uint256(0), ""
+        );
+
+        SolverOperation[] memory solverOps = new SolverOperation[](1);
+        solverOps[0] = SolverOperation({
+            from: solverEOA,
+            to: address(atlas),
+            value: 0,
+            gas: 6_000_000,
+            maxFeePerGas: 1e9,
+            deadline: block.number + 100,
+            solver: address(listaSolver),
+            control: address(dappControl),
+            userOpHash: userOpHash,
+            bidToken: address(0),
+            bidAmount: 0,
+            data: solverOpData,
+            signature: new bytes(0)
+        });
+
+        (sig.v, sig.r, sig.s) = vm.sign(solverPK, atlasVerification.getSolverPayload(solverOps[0]));
+        solverOps[0].signature = abi.encodePacked(sig.r, sig.s, sig.v);
+
+        // Use UNAUTHORIZED bundler address in DAppOp
+        address unauthorizedBundler = makeAddr("unauthorizedBundler");
+        vm.deal(unauthorizedBundler, 10e18);
+
+        bytes32 callChainHash = CallVerification.getCallChainHash(userOp, solverOps);
+        DAppOperation memory dAppOp = DAppOperation({
+            from: auctioneer,
+            to: address(atlas),
+            nonce: 0,
+            deadline: block.number + 100,
+            control: address(dappControl),
+            bundler: unauthorizedBundler,
+            userOpHash: userOpHash,
+            callChainHash: callChainHash,
+            signature: new bytes(0)
+        });
+
+        (sig.v, sig.r, sig.s) = vm.sign(auctioneerPK, atlasVerification.getDAppOperationPayload(dAppOp));
+        dAppOp.signature = abi.encodePacked(sig.r, sig.s, sig.v);
+
+        vm.txGasPrice(1e9);
+
+        // Metacall from unauthorized bundler should revert (PreOpsFail due to BundlerIsNotAuthorizedSender)
+        vm.prank(unauthorizedBundler, unauthorizedBundler);
+        vm.expectRevert();
+        atlas.metacall{ gas: 8_000_000 }(userOp, solverOps, dAppOp, address(0));
+
+        // Oracle price should be unchanged
+        assertEq(mockOracle.price(), 100, "Oracle price should not have changed");
     }
 }
