@@ -37,7 +37,6 @@ contract SVRLiquidationWrapperUnitTest is Test {
     address solver = makeAddr("solver");
     address nop = makeAddr("nop");
     address borrower = makeAddr("borrower");
-    address nonSolver = makeAddr("nonSolver");
     address nonNOP = makeAddr("nonNOP");
 
     MarketParams defaultMarketParams;
@@ -57,11 +56,9 @@ contract SVRLiquidationWrapperUnitTest is Test {
             lltv: 8000
         });
 
-        // Setup: owner approves solver and NOP
-        vm.startPrank(owner);
-        wrapper.addApprovedSolver(solver);
+        // Setup: owner approves NOP
+        vm.prank(owner);
         wrapper.addApprovedNOP(nop);
-        vm.stopPrank();
 
         // Whitelist wrapper on the mock liquidator
         liquidator.setApprovedCaller(address(wrapper));
@@ -80,29 +77,6 @@ contract SVRLiquidationWrapperUnitTest is Test {
     // ------------------------------------------------ //
     //              Admin Function Tests                //
     // ------------------------------------------------ //
-
-    function test_addApprovedSolver() public {
-        address newSolver = makeAddr("newSolver");
-        assertFalse(wrapper.approvedSolvers(newSolver));
-
-        vm.prank(owner);
-        vm.expectEmit(true, false, false, true);
-        emit SVRLiquidationWrapper.SolverAdded(newSolver);
-        wrapper.addApprovedSolver(newSolver);
-
-        assertTrue(wrapper.approvedSolvers(newSolver));
-    }
-
-    function test_removeApprovedSolver() public {
-        assertTrue(wrapper.approvedSolvers(solver));
-
-        vm.prank(owner);
-        vm.expectEmit(true, false, false, true);
-        emit SVRLiquidationWrapper.SolverRemoved(solver);
-        wrapper.removeApprovedSolver(solver);
-
-        assertFalse(wrapper.approvedSolvers(solver));
-    }
 
     function test_addApprovedNOP() public {
         address newNOP = makeAddr("newNOP");
@@ -127,16 +101,11 @@ contract SVRLiquidationWrapperUnitTest is Test {
         assertFalse(wrapper.approvedNOPs(nop));
     }
 
-    function test_onlyOwnerCanAddSolver() public {
-        vm.prank(nonSolver);
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, nonSolver));
-        wrapper.addApprovedSolver(nonSolver);
-    }
-
     function test_onlyOwnerCanAddNOP() public {
-        vm.prank(nonSolver);
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, nonSolver));
-        wrapper.addApprovedNOP(nonSolver);
+        address nonOwner = makeAddr("nonOwner");
+        vm.prank(nonOwner);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, nonOwner));
+        wrapper.addApprovedNOP(nonOwner);
     }
 
     function test_recoverToken() public {
@@ -154,21 +123,9 @@ contract SVRLiquidationWrapperUnitTest is Test {
     //          Access Control Rejection Tests          //
     // ------------------------------------------------ //
 
-    function test_rejectsNonApprovedSolver() public {
-        vm.prank(nonSolver, nop); // msg.sender = nonSolver, tx.origin = nop
-        vm.expectRevert(SVRLiquidationWrapper.NotApprovedSolver.selector);
-        wrapper.liquidate(defaultMarketParams, borrower, 100e18, 0, "");
-    }
-
     function test_rejectsNonApprovedNOP() public {
         vm.prank(solver, nonNOP); // msg.sender = solver, tx.origin = nonNOP
         vm.expectRevert(SVRLiquidationWrapper.NotApprovedNOP.selector);
-        wrapper.liquidate(defaultMarketParams, borrower, 100e18, 0, "");
-    }
-
-    function test_rejectsBothInvalid() public {
-        vm.prank(nonSolver, nonNOP);
-        vm.expectRevert(SVRLiquidationWrapper.NotApprovedSolver.selector);
         wrapper.liquidate(defaultMarketParams, borrower, 100e18, 0, "");
     }
 
@@ -234,7 +191,7 @@ contract SVRLiquidationWrapperUnitTest is Test {
     }
 
     function test_onMorphoLiquidateOnlyCallableByLiquidator() public {
-        vm.prank(nonSolver);
+        vm.prank(nonNOP);
         vm.expectRevert(SVRLiquidationWrapper.NotLiquidator.selector);
         wrapper.onMorphoLiquidate(100, "");
     }
@@ -571,8 +528,7 @@ contract SVRLiquidationWrapperIntegrationTest is Test {
         atlas.bond(1e18);
         vm.stopPrank();
 
-        // Approve solver on wrapper + bundlerNOP as approved NOP
-        wrapper.addApprovedSolver(address(listaSolver));
+        // Approve bundlerNOP as approved NOP
         wrapper.addApprovedNOP(bundlerNOP);
 
         // Fund tokens
@@ -748,7 +704,6 @@ contract SVRLiquidationWrapperIntegrationTest is Test {
         atlas.bond(1e18);
         vm.stopPrank();
 
-        wrapper.addApprovedSolver(address(listaSolver));
         wrapper.addApprovedNOP(bundlerNOP);
 
         loanToken.mint(address(listaSolver), 1000e18);

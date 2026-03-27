@@ -19,26 +19,24 @@ interface IListaLiquidator {
 
 /// @title SVRLiquidationWrapper
 /// @notice Wrapper that sits between Atlas solvers and the ListaDAO Liquidator.
-///         Enforces dual access control: approved solver (msg.sender) + approved NOP (tx.origin).
+///         Validates tx.origin is an approved NOP to confirm this is a genuine Atlas SVR transaction.
+///         Atlas already validates solvers through bonding, registration, and DappControl verification,
+///         so no additional solver whitelisting is needed on the wrapper.
 ///         Handles token approvals, forwards liquidation calls, and routes tokens back to solver.
 contract SVRLiquidationWrapper is Ownable, IMorphoLiquidateCallback {
     using SafeERC20 for IERC20;
 
     address public immutable liquidator;
 
-    mapping(address => bool) public approvedSolvers;
     mapping(address => bool) public approvedNOPs;
 
     // Transient storage for mid-liquidation callback context
     address private _activeSolver;
     address private _activeLoanToken;
 
-    error NotApprovedSolver();
     error NotApprovedNOP();
     error NotLiquidator();
 
-    event SolverAdded(address indexed solver);
-    event SolverRemoved(address indexed solver);
     event NOPAdded(address indexed nop);
     event NOPRemoved(address indexed nop);
     event LiquidationExecuted(
@@ -56,16 +54,6 @@ contract SVRLiquidationWrapper is Ownable, IMorphoLiquidateCallback {
     // ---------------------------------------------------- //
     //                  Admin Functions                      //
     // ---------------------------------------------------- //
-
-    function addApprovedSolver(address solver) external onlyOwner {
-        approvedSolvers[solver] = true;
-        emit SolverAdded(solver);
-    }
-
-    function removeApprovedSolver(address solver) external onlyOwner {
-        approvedSolvers[solver] = false;
-        emit SolverRemoved(solver);
-    }
 
     function addApprovedNOP(address nop) external onlyOwner {
         approvedNOPs[nop] = true;
@@ -86,7 +74,9 @@ contract SVRLiquidationWrapper is Ownable, IMorphoLiquidateCallback {
     // ---------------------------------------------------- //
 
     /// @notice Execute a liquidation through the ListaDAO Liquidator
-    /// @dev Caller must be an approved solver, tx.origin must be an approved NOP
+    /// @dev tx.origin must be an approved NOP (confirms genuine Atlas SVR transaction).
+    ///      No solver whitelisting needed — Atlas validates solvers through bonding,
+    ///      registration, and DappControl verification.
     /// @param marketParams Morpho-style market parameters
     /// @param borrower The borrower being liquidated
     /// @param seizedAssets Amount of collateral to seize
@@ -99,7 +89,6 @@ contract SVRLiquidationWrapper is Ownable, IMorphoLiquidateCallback {
         uint256 repaidShares,
         bytes calldata data
     ) external returns (uint256 actualSeizedAssets, uint256 actualRepaidAssets) {
-        require(approvedSolvers[msg.sender], NotApprovedSolver());
         // solhint-disable-next-line avoid-tx-origin
         require(approvedNOPs[tx.origin], NotApprovedNOP());
 

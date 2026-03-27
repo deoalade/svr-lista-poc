@@ -4,7 +4,7 @@ A lightweight wrapper contract that enables [Chainlink SVR](https://docs.chain.l
 
 ## The Problem
 
-ListaDAO's Liquidator contract only accepts liquidation calls from **pre-approved (whitelisted) addresses**. In the Atlas SVR flow, the direct caller is the searcher's solver contract and the transaction is submitted by a Chainlink node operator — neither is a fixed whitelistable address. This wrapper solves that by becoming the single whitelisted address on ListaDAO and validating inbound calls before forwarding them.
+ListaDAO's Liquidator contract only accepts liquidation calls from **pre-approved (whitelisted) addresses**. In the Atlas SVR flow, the direct caller is the searcher's solver contract and the transaction is submitted by a Chainlink node operator — neither is a fixed whitelistable address. This wrapper solves that by becoming the single whitelisted address on ListaDAO and validating that `tx.origin` is an approved NOP before forwarding calls. No solver whitelisting is needed on the wrapper — Atlas already validates solvers through bonding, registration, and DappControl verification.
 
 ## Full SVR Flow
 
@@ -32,7 +32,6 @@ Chainlink NOP (bundler) submits Atlas metacall
     ├── Atlas calls winning solver via ExecutionEnvironment
     ├── SolverBase.atlasSolverCall() → SVRListaSolver.executeLiquidation()
     ├── Solver calls SVRLiquidationWrapper.liquidate()
-    │   ├── Validates msg.sender is approved solver
     │   ├── Validates tx.origin is approved NOP (= bundler)
     │   └── Forwards to ListaDAO Liquidator
     │       ├── ListaDAO sees wrapper as caller → whitelist passes
@@ -54,7 +53,7 @@ Chainlink NOP (bundler) submits Atlas metacall
 
 | Contract | Location | Description |
 |---|---|---|
-| `SVRLiquidationWrapper.sol` | `src/` | Core wrapper. Whitelisted on ListaDAO. Validates callers (dual access control), forwards liquidations, handles token routing and Morpho callback. |
+| `SVRLiquidationWrapper.sol` | `src/` | Core wrapper. Whitelisted on ListaDAO. Validates tx.origin is an approved NOP (Atlas handles solver validation), forwards liquidations, handles token routing and Morpho callback. |
 | `SVRListaSolver.sol` | `src/` | Atlas solver (inherits `SolverBase`). Called during `metacall`, invokes the wrapper. |
 
 ### Chainlink SVR Reference (not ours to deploy)
@@ -85,10 +84,8 @@ Chainlink NOP (bundler) submits Atlas metacall
 
 | Function | Access | Description |
 |---|---|---|
-| `liquidate()` | Approved solver + approved NOP | Pass-through to ListaDAO Liquidator with dual validation |
+| `liquidate()` | Approved NOP (tx.origin) | Pass-through to ListaDAO Liquidator with NOP validation |
 | `onMorphoLiquidate()` | Liquidator only | Callback during liquidation — pulls loan tokens from solver |
-| `addApprovedSolver()` | Owner | Register a searcher's solver contract |
-| `removeApprovedSolver()` | Owner | Remove a solver from the approved list |
 | `addApprovedNOP()` | Owner | Register a Chainlink node operator EOA |
 | `removeApprovedNOP()` | Owner | Remove a node operator |
 | `recoverToken()` | Owner | Emergency token recovery |
@@ -113,11 +110,11 @@ Key configuration during deployment:
 
 ## Test Coverage
 
-**17 tests total, all passing. No RPC or fork required.**
+**12 tests total, all passing. No RPC or fork required.**
 
-### Unit Tests (15)
-- Access control: rejects unapproved solvers, unapproved NOPs, both invalid
-- Admin functions: add/remove solvers and NOPs, owner-only enforcement
+### Unit Tests (10)
+- Access control: rejects unapproved NOPs
+- Admin functions: add/remove NOPs, owner-only enforcement
 - Token recovery
 - Successful liquidation with full token flow verification
 - Callback data handling
